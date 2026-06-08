@@ -1,304 +1,453 @@
-
-from __future__ import annotations
-
-import math
-import re
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse, JSONResponse
 from pathlib import Path
-from typing import Any
+from datetime import datetime
+import csv
+import html
 
-import pandas as pd
-from fastapi import FastAPI, File, Request, UploadFile
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.templating import Jinja2Templates
+try:
+    from openpyxl import load_workbook
+except Exception:
+    load_workbook = None
+
+app = FastAPI(title="Klimaat Dashboard Kas4")
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
-UPLOAD_DIR = DATA_DIR / "uploads"
-DEFAULT_EXCEL = DATA_DIR / "Overzicht_alle_dagen.xlsx"
-PER_DAG_DIR = DATA_DIR / "per_dag"
+EXCEL_FILE = DATA_DIR / "Overzicht_alle_dagen.xlsx"
 REFERENCE_KAS = 4
 
-app = FastAPI(title="Klimaat historisch dashboard", version="1.0.0")
-templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
-
-def _to_float(value: Any) -> float | None:
-    """Maak van Excel/CSV waarden veilige floats voor JSON/grafieken."""
+def to_float(value):
     if value is None:
         return None
-    try:
-        if pd.isna(value):
-            return None
-    except TypeError:
-        pass
-    if isinstance(value, str):
-        value = value.replace(",", ".").strip()
-        if value == "":
-            return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
+
+    if isinstance(value, (int, float)):
+        return float(value)
+
+    text = str(value).strip().replace(",", ".")
+    if not text:
         return None
-    if math.isnan(number) or math.isinf(number):
+
+    try:
+        return float(text)
+    except ValueError:
         return None
-    return round(number, 2)
 
 
-def _clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+def fmt(value, digits=1):
+    if value is None:
+        return "-"
 
-    # Verwijder lege kolommen/regels.
-    df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
-
-    # Datumkolom herkennen.
-    date_candidates = [c for c in df.columns if c.lower() in {"datum", "date", "dag"}]
-    if date_candidates:
-        date_col = date_candidates[0]
-    else:
-        date_col = df.columns[0]
-        df = df.rename(columns={date_col: "Datum"})
-        date_col = "Datum"
-
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-    df = df[df[date_col].notna()].sort_values(date_col)
-    df["Datum"] = df[date_col].dt.strftime("%Y-%m-%d")
-
-    # Alles wat lijkt op klimaatwaarde numeriek maken.
-    for col in df.columns:
-        if col == "Datum":
-            continue
-        if any(key.lower() in col.lower() for key in ["temp", "vd", "rv", "rh", "straling", "wind", "metingen"]):
-            df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", ".", regex=False), errors="coerce")
-
-    return df
+    try:
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return str(value)
 
 
-def _read_excel(path: Path) -> pd.DataFrame:
-    xls = pd.ExcelFile(path)
-    sheet = "Alle dagen" if "Alle dagen" in xls.sheet_names else xls.sheet_names[0]
-    return _clean_dataframe(pd.read_excel(path, sheet_name=sheet))
+def read_excel_rows():
+    if not EXCEL_FILE.exists() or load_workbook is None:
+        return []
+
+    workbook = load_workbook(EXCEL_FILE, read_only=True, data_only=True)
+    sheet_name = "Alle dagen" if "Alle dagen" in workbook.sheetnames else workbook.sheetnames[0]
+    worksheet = workbook[sheet_name]
+
+    rows = list(worksheet.iter_rows(values_only=True))
+    if not rows:
+        return []
+
+    headers = [str(h).strip() if h is not None else "" for h in rows[0]]
+    output = []
+
+    for raw_row in rows[1:]:
+        item = {}
+        for key, value in zip(headers, raw_row):
+            if key:
+                item[key] = value
+
+        if any(value is not None for value in item.values()):
+            output.append(item)
+
+    return output
 
 
-def _read_csv_folder(path: Path) -> pd.DataFrame:
-    files = sorted(path.glob("**/*.csv"))
-    if not files:
-        return pd.DataFrame()
+def read_csv_rows():
+    folder = DATA_DIR / "per_dag"
+    if not folder.exists():
+        return []
 
-    frames: list[pd.DataFrame] = []
-    for file in files:
+    output = []
+
+    for path in sorted(folder.rglob("*.csv")):
         try:
-            frames.append(pd.read_csv(file, sep=None, engine="python"))
+            with path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                output.extend(dict(row) for row in reader)
         except Exception:
             continue
 
-    if not frames:
-        return pd.DataFrame()
-
-    return _clean_dataframe(pd.concat(frames, ignore_index=True))
+    return output
 
 
-def load_data() -> tuple[pd.DataFrame, str, str | None]:
-    """Laad eerst uploads, daarna standaard Excel, daarna CSV-map."""
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+def load_rows():
+    rows = read_excel_rows()
+    if rows:
+        return rows, "data/Overzicht_alle_dagen.xlsx"
 
-    uploaded_excels = sorted(UPLOAD_DIR.glob("*.xlsx"), key=lambda p: p.stat().st_mtime, reverse=True)
-    candidates = uploaded_excels + ([DEFAULT_EXCEL] if DEFAULT_EXCEL.exists() else [])
+    rows = read_csv_rows()
+    if rows:
+        return rows, "data/per_dag/*.csv"
 
-    for path in candidates:
-        try:
-            df = _read_excel(path)
-            if not df.empty:
-                return df, path.name, None
-        except Exception as exc:
-            return pd.DataFrame(), str(path.name), f"Excelbestand kon niet worden gelezen: {exc}"
-
-    try:
-        df = _read_csv_folder(PER_DAG_DIR)
-        if not df.empty:
-            return df, "data/per_dag/*.csv", None
-    except Exception as exc:
-        return pd.DataFrame(), "data/per_dag/*.csv", f"CSV-map kon niet worden gelezen: {exc}"
-
-    return pd.DataFrame(), "geen data", "Geen data gevonden. Upload Overzicht_alle_dagen.xlsx of plaats het bestand in data/."
+    return [], "geen databestand gevonden"
 
 
-def kas_numbers(df: pd.DataFrame) -> list[int]:
-    numbers: set[int] = set()
-    for col in df.columns:
-        for match in re.finditer(r"(?:Afd|Kas)\s*_?\s*(\d+)", col, flags=re.IGNORECASE):
-            numbers.add(int(match.group(1)))
-    return sorted(numbers)
+def get_date(row):
+    for key in ("Datum", "datum", "Date", "date"):
+        value = row.get(key)
+        if value is None:
+            continue
+
+        if isinstance(value, datetime):
+            return value.strftime("%Y-%m-%d")
+
+        return str(value)[:10]
+
+    return "-"
 
 
-def find_col(df: pd.DataFrame, kas: int, contains: list[str]) -> str | None:
-    candidates = []
-    for col in df.columns:
-        low = col.lower().replace(" ", "")
-        kas_match = f"afd{kas}" in low or f"kas{kas}" in low or f"afd_{kas}" in low or f"kas_{kas}" in low
-        if kas_match and all(item.lower() in low for item in contains):
-            candidates.append(col)
-    return candidates[0] if candidates else None
+def get_value(row, kas, metric):
+    keys = [
+        f"{metric}_Afd{kas}",
+        f"{metric}_Kas{kas}",
+        f"Afd{kas}_{metric}",
+        f"Kas{kas}_{metric}",
+    ]
+
+    for key in keys:
+        if key in row:
+            return to_float(row.get(key))
+
+    return None
 
 
-def latest_non_null(df: pd.DataFrame, col: str | None) -> float | None:
-    if not col or col not in df.columns:
-        return None
-    series = df[col].dropna()
-    if series.empty:
-        return None
-    return _to_float(series.iloc[-1])
+def avg(values):
+    numbers = [value for value in values if value is not None]
+    return sum(numbers) / len(numbers) if numbers else None
 
 
-def avg_col(df: pd.DataFrame, col: str | None) -> float | None:
-    if not col or col not in df.columns:
-        return None
-    value = pd.to_numeric(df[col], errors="coerce").mean()
-    return _to_float(value)
+def max_or_none(values):
+    numbers = [value for value in values if value is not None]
+    return max(numbers) if numbers else None
 
 
-def max_col(df: pd.DataFrame, col: str | None) -> float | None:
-    if not col or col not in df.columns:
-        return None
-    value = pd.to_numeric(df[col], errors="coerce").max()
-    return _to_float(value)
+def summarize(rows):
+    summary = []
+
+    for kas in range(1, 7):
+        tmax_values = [get_value(row, kas, "Temp_max") for row in rows]
+        vdmax_values = [get_value(row, kas, "VD_max") for row in rows]
+        vdgem_values = [get_value(row, kas, "VD_gem") for row in rows]
+
+        # Extra ondersteuning voor kolomnamen uit het aangeleverde Excelbestand:
+        # Temp_Afd1_max, VD_Afd1_max, VD_Afd1_gem, enz.
+        tmax_values = [
+            to_float(row.get(f"Temp_Afd{kas}_max")) if f"Temp_Afd{kas}_max" in row else value
+            for row, value in zip(rows, tmax_values)
+        ]
+
+        vdmax_values = [
+            to_float(row.get(f"VD_Afd{kas}_max")) if f"VD_Afd{kas}_max" in row else value
+            for row, value in zip(rows, vdmax_values)
+        ]
+
+        vdgem_values = [
+            to_float(row.get(f"VD_Afd{kas}_gem")) if f"VD_Afd{kas}_gem" in row else value
+            for row, value in zip(rows, vdgem_values)
+        ]
+
+        summary.append(
+            {
+                "kas": kas,
+                "tmax_avg": avg(tmax_values),
+                "tmax_max": max_or_none(tmax_values),
+                "vdmax_avg": avg(vdmax_values),
+                "vdmax_max": max_or_none(vdmax_values),
+                "vdgem_avg": avg(vdgem_values),
+            }
+        )
+
+    return summary
 
 
-def build_dashboard(df: pd.DataFrame) -> dict[str, Any]:
-    if df.empty:
-        return {
-            "kas_numbers": [],
-            "stats": [],
-            "critical_days": [],
-            "chart": {"labels": [], "vd": [], "temp": []},
-            "summary": {},
-        }
+def build_analysis():
+    rows, source = load_rows()
+    summary = summarize(rows)
 
-    numbers = kas_numbers(df)
-    if not numbers:
-        numbers = [1, 2, 3, 4, 5, 6]
+    reference = next((item for item in summary if item["kas"] == REFERENCE_KAS), None)
 
-    labels = df["Datum"].astype(str).tolist() if "Datum" in df.columns else [str(i + 1) for i in range(len(df))]
+    differences = []
+    if reference:
+        for item in summary:
+            differences.append(
+                {
+                    "kas": item["kas"],
+                    "dtmax": None
+                    if item["tmax_avg"] is None or reference["tmax_avg"] is None
+                    else item["tmax_avg"] - reference["tmax_avg"],
+                    "dvdmax": None
+                    if item["vdmax_avg"] is None or reference["vdmax_avg"] is None
+                    else item["vdmax_avg"] - reference["vdmax_avg"],
+                    "dvdgem": None
+                    if item["vdgem_avg"] is None or reference["vdgem_avg"] is None
+                    else item["vdgem_avg"] - reference["vdgem_avg"],
+                }
+            )
 
-    stats = []
-    ref_vd_col = find_col(df, REFERENCE_KAS, ["vd", "max"])
-    ref_temp_col = find_col(df, REFERENCE_KAS, ["temp", "max"])
-    ref_vd_avg = avg_col(df, ref_vd_col)
-    ref_temp_avg = avg_col(df, ref_temp_col)
+    critical = []
 
-    vd_chart = []
-    temp_chart = []
+    for row in rows:
+        values = []
 
-    for kas in numbers:
-        vd_max_col = find_col(df, kas, ["vd", "max"])
-        vd_gem_col = find_col(df, kas, ["vd", "gem"])
-        temp_max_col = find_col(df, kas, ["temp", "max"])
+        for kas in range(1, 7):
+            value = to_float(row.get(f"VD_Afd{kas}_max"))
 
-        kas_vd_avg = avg_col(df, vd_max_col)
-        kas_temp_avg = avg_col(df, temp_max_col)
+            if value is not None:
+                values.append((kas, value))
 
-        stats.append({
-            "kas": kas,
-            "is_reference": kas == REFERENCE_KAS,
-            "temp_max_avg": kas_temp_avg,
-            "temp_max_highest": max_col(df, temp_max_col),
-            "vd_max_avg": kas_vd_avg,
-            "vd_max_highest": max_col(df, vd_max_col),
-            "vd_gem_avg": avg_col(df, vd_gem_col),
-            "delta_temp_vs_ref": _to_float(kas_temp_avg - ref_temp_avg) if kas_temp_avg is not None and ref_temp_avg is not None else None,
-            "delta_vd_vs_ref": _to_float(kas_vd_avg - ref_vd_avg) if kas_vd_avg is not None and ref_vd_avg is not None else None,
-        })
+        if values:
+            kas, value = max(values, key=lambda item: item[1])
+            critical.append(
+                {
+                    "date": get_date(row),
+                    "kas": kas,
+                    "vd": value,
+                }
+            )
 
-        if vd_max_col:
-            vd_chart.append({
-                "label": f"Kas {kas} VD max",
-                "data": [_to_float(v) for v in df[vd_max_col].tolist()],
-                "reference": kas == REFERENCE_KAS,
-            })
-        if temp_max_col:
-            temp_chart.append({
-                "label": f"Kas {kas} Tmax",
-                "data": [_to_float(v) for v in df[temp_max_col].tolist()],
-                "reference": kas == REFERENCE_KAS,
-            })
-
-    # Kritische dagen: hoogste VD over beschikbare kassen.
-    vd_cols = [find_col(df, kas, ["vd", "max"]) for kas in numbers]
-    vd_cols = [c for c in vd_cols if c]
-    critical_days = []
-    if vd_cols:
-        tmp = df[["Datum"] + vd_cols].copy()
-        tmp["VD_piek"] = tmp[vd_cols].max(axis=1)
-        tmp = tmp.sort_values("VD_piek", ascending=False).head(10)
-        for _, row in tmp.iterrows():
-            critical_days.append({
-                "datum": str(row["Datum"]),
-                "vd_piek": _to_float(row["VD_piek"]),
-            })
-
-    warmer = [s for s in stats if s["kas"] != REFERENCE_KAS and s["delta_temp_vs_ref"] is not None and s["delta_temp_vs_ref"] > 0.75]
-    droger = [s for s in stats if s["kas"] != REFERENCE_KAS and s["delta_vd_vs_ref"] is not None and s["delta_vd_vs_ref"] > 1.5]
-
-    advice = []
-    if warmer:
-        advice.append("Kassen " + ", ".join(str(s["kas"]) for s in warmer) + " zijn gemiddeld duidelijk warmer dan referentie Kas4.")
-    if droger:
-        advice.append("Kassen " + ", ".join(str(s["kas"]) for s in droger) + " zijn gemiddeld duidelijk droger/hoger in VD dan Kas4.")
-    if not advice:
-        advice.append("Geen grote structurele afwijking t.o.v. Kas4 gevonden in de geladen data.")
+    critical = sorted(critical, key=lambda item: item["vd"], reverse=True)[:10]
 
     return {
-        "kas_numbers": numbers,
-        "stats": stats,
-        "critical_days": critical_days,
-        "chart": {"labels": labels, "vd": vd_chart, "temp": temp_chart},
-        "summary": {
-            "days": len(df),
-            "start": labels[0] if labels else None,
-            "end": labels[-1] if labels else None,
-            "reference_kas": REFERENCE_KAS,
-            "advice": advice,
-        },
+        "status": "ok",
+        "reference_kas": REFERENCE_KAS,
+        "rows_count": len(rows),
+        "source": source,
+        "summary": summary,
+        "differences": differences,
+        "critical": critical,
     }
 
 
+def render_table(headers, rows):
+    header_html = "".join(f"<th>{html.escape(str(header))}</th>" for header in headers)
+
+    row_html = ""
+    for row in rows:
+        row_html += "<tr>" + "".join(f"<td>{cell}</td>" for cell in row) + "</tr>"
+
+    return f"<table><tr>{header_html}</tr>{row_html}</table>"
+
+
+def render_page(data):
+    warning = ""
+
+    if data["rows_count"] == 0:
+        warning = (
+            "<div class='warning'>"
+            "Geen historische data gevonden. "
+            "Zet <b>Overzicht_alle_dagen.xlsx</b> in de map <b>data/</b>. "
+            "De app draait wel goed."
+            "</div>"
+        )
+
+    summary_rows = [
+        [
+            f"Kas {item['kas']}",
+            f"{fmt(item['tmax_avg'])} °C",
+            f"{fmt(item['tmax_max'])} °C",
+            fmt(item["vdmax_avg"]),
+            fmt(item["vdmax_max"]),
+            fmt(item["vdgem_avg"]),
+        ]
+        for item in data["summary"]
+    ]
+
+    diff_rows = [
+        [
+            f"Kas {item['kas']}",
+            f"{fmt(item['dtmax'])} °C",
+            fmt(item["dvdmax"]),
+            fmt(item["dvdgem"]),
+        ]
+        for item in data["differences"]
+    ]
+
+    critical_rows = [
+        [
+            html.escape(str(item["date"])),
+            f"Kas {item['kas']}",
+            fmt(item["vd"]),
+        ]
+        for item in data["critical"]
+    ]
+
+    return f"""<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Klimaat Dashboard - Kas4</title>
+  <style>
+    body {{
+      margin: 0;
+      font-family: Arial, sans-serif;
+      background: #eef3f0;
+      color: #13251d;
+    }}
+
+    header {{
+      background: #123c2c;
+      color: white;
+      padding: 28px 36px;
+    }}
+
+    main {{
+      max-width: 1200px;
+      margin: auto;
+      padding: 28px 36px;
+    }}
+
+    .cards {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 16px;
+    }}
+
+    .card {{
+      background: white;
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 8px 20px rgba(0,0,0,.08);
+    }}
+
+    .value {{
+      font-size: 28px;
+      font-weight: 700;
+      margin-top: 8px;
+    }}
+
+    .ok {{
+      color: #1d6b3a;
+    }}
+
+    .warning {{
+      background: #fff3cd;
+      border: 1px solid #e2c46d;
+      padding: 14px 16px;
+      border-radius: 12px;
+      margin-bottom: 18px;
+    }}
+
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      background: white;
+      border-radius: 14px;
+      overflow: hidden;
+      margin: 18px 0 32px;
+      box-shadow: 0 8px 20px rgba(0,0,0,.06);
+    }}
+
+    th,
+    td {{
+      padding: 10px 12px;
+      border-bottom: 1px solid #e3e8e4;
+      text-align: left;
+    }}
+
+    th {{
+      background: #dfeae3;
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Klimaat Dashboard</h1>
+    <div>Historische analyse met <b>Kas4</b> als referentiekas</div>
+  </header>
+
+  <main>
+    {warning}
+
+    <div class="cards">
+      <div class="card">
+        <div>Status</div>
+        <div class="value ok">Online</div>
+      </div>
+
+      <div class="card">
+        <div>Referentie</div>
+        <div class="value">Kas4</div>
+      </div>
+
+      <div class="card">
+        <div>Datapunten</div>
+        <div class="value">{data['rows_count']}</div>
+      </div>
+
+      <div class="card">
+        <div>Bron</div>
+        <div>{html.escape(data['source'])}</div>
+      </div>
+    </div>
+
+    <h2>Samenvatting per kas</h2>
+    {render_table(
+        ["Kas", "Gem. Tmax", "Hoogste Tmax", "Gem. VD max", "Hoogste VD max", "Gem. VD gemiddeld"],
+        summary_rows
+    )}
+
+    <h2>Afwijking t.o.v. Kas4</h2>
+    {render_table(
+        ["Kas", "Δ gem. Tmax", "Δ gem. VD max", "Δ gem. VD gemiddeld"],
+        diff_rows
+    )}
+
+    <h2>Top 10 kritische VD-pieken</h2>
+    {render_table(
+        ["Datum", "Kas", "VD max"],
+        critical_rows
+    )}
+  </main>
+</body>
+</html>"""
+
+
 @app.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+def health():
+    return {
+        "status": "ok",
+        "reference_kas": REFERENCE_KAS,
+    }
 
 
 @app.get("/api/data")
-def api_data() -> JSONResponse:
-    df, source, error = load_data()
-    payload = build_dashboard(df)
-    payload["source"] = source
-    payload["error"] = error
-    return JSONResponse(payload)
+def api_data():
+    return JSONResponse(build_analysis())
 
 
-@app.get("/")
-def dashboard(request: Request):
-    df, source, error = load_data()
-    payload = build_dashboard(df)
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "source": source,
-            "error": error,
-            "dashboard": payload,
-        },
-    )
+@app.get("/", response_class=HTMLResponse)
+def dashboard():
+    try:
+        return HTMLResponse(render_page(build_analysis()))
+    except Exception as exc:
+        safe = html.escape(str(exc))
 
-
-@app.post("/upload")
-async def upload_excel(file: UploadFile = File(...)):
-    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    if not file.filename or not file.filename.lower().endswith(".xlsx"):
-        return JSONResponse({"error": "Upload een .xlsx bestand."}, status_code=400)
-
-    target = UPLOAD_DIR / "Overzicht_alle_dagen_uploaded.xlsx"
-    content = await file.read()
-    target.write_bytes(content)
-    return RedirectResponse(url="/", status_code=303)
+        return HTMLResponse(
+            f"""
+            <h1>Klimaat Dashboard</h1>
+            <p>App draait, maar analyse gaf een fout:</p>
+            <pre>{safe}</pre>
+            """,
+            status_code=200,
+        )
