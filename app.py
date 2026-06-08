@@ -22,6 +22,14 @@ CSV_FILE = CSV_DIR / "Overzicht_alle_dagen.csv"
 REMOTE_CSV_URL = "https://raw.githubusercontent.com/peekbv-rgb/historischvergelijk-uden/main/data/per_dag/Overzicht_alle_dagen.csv"
 REFERENCE_KAS = 4
 KASSEN = [1, 2, 3, 4, 5, 6]
+KAS_COLORS = {
+    1: "#d9480f",
+    2: "#e67700",
+    3: "#f08c00",
+    4: "#1864ab",
+    5: "#2b8a3e",
+    6: "#087f5b",
+}
 
 
 def to_float(value):
@@ -146,6 +154,16 @@ def get_date(row):
     return "-"
 
 
+def parse_date(value):
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()[:10]
+    try:
+        return datetime.strptime(text, "%Y-%m-%d")
+    except Exception:
+        return datetime.min
+
+
 def get_metric(row, kas, metric):
     keys = [
         f"{metric}_Afd{kas}",
@@ -197,6 +215,35 @@ def summarize(rows):
     return summary
 
 
+def latest_rows(rows, limit=20):
+    valid_rows = [row for row in rows if get_date(row) != "-"]
+    return sorted(valid_rows, key=lambda row: parse_date(get_date(row)))[-limit:]
+
+
+def build_timeseries(rows, limit=20):
+    series = []
+    for row in latest_rows(rows, limit):
+        ref_vd = get_vd_max(row, REFERENCE_KAS)
+        ref_temp = get_tmax(row, REFERENCE_KAS)
+        item = {
+            "date": get_date(row),
+            "values": {},
+        }
+
+        for kas in KASSEN:
+            vdmax = get_vd_max(row, kas)
+            tmax = get_tmax(row, kas)
+            item["values"][kas] = {
+                "tmax": tmax,
+                "vdmax": vdmax,
+                "vd_delta": None if vdmax is None or ref_vd is None else vdmax - ref_vd,
+                "temp_delta": None if tmax is None or ref_temp is None else tmax - ref_temp,
+            }
+
+        series.append(item)
+    return series
+
+
 def build_analysis():
     rows, source = load_rows()
     summary = summarize(rows)
@@ -232,6 +279,7 @@ def build_analysis():
         "summary": summary,
         "differences": differences,
         "critical": critical,
+        "timeseries": build_timeseries(rows, 20),
     }
 
 
@@ -243,6 +291,126 @@ def render_table(headers, rows):
     header_html = "".join(f"<th>{html.escape(str(header))}</th>" for header in headers)
     body_html = "".join("<tr>" + "".join(cell(c) for c in row) + "</tr>" for row in rows)
     return f"<table><tr>{header_html}</tr>{body_html}</table>"
+
+
+def nice_axis_bounds(values):
+    numbers = [v for v in values if v is not None]
+    if not numbers:
+        return 0, 1
+    low = min(numbers)
+    high = max(numbers)
+    if low == high:
+        return low - 1, high + 1
+    padding = (high - low) * 0.12
+    return low - padding, high + padding
+
+
+def render_line_chart(title, timeseries, metric, unit="", include_kas=None):
+    if include_kas is None:
+        include_kas = KASSEN
+
+    width = 980
+    height = 360
+    left = 62
+    right = 28
+    top = 34
+    bottom = 58
+    plot_w = width - left - right
+    plot_h = height - top - bottom
+
+    dates = [item["date"] for item in timeseries]
+    all_values = [
+        item["values"].get(kas, {}).get(metric)
+        for item in timeseries
+        for kas in include_kas
+    ]
+    y_min, y_max = nice_axis_bounds(all_values)
+
+    def x_pos(index):
+        if len(timeseries) <= 1:
+            return left + plot_w / 2
+        return left + (index / (len(timeseries) - 1)) * plot_w
+
+    def y_pos(value):
+        if value is None:
+            return None
+        return top + (y_max - value) / (y_max - y_min) * plot_h
+
+    grid = []
+    labels = []
+    for i in range(5):
+        value = y_min + ((y_max - y_min) / 4) * i
+        y = y_pos(value)
+        grid.append(f'<line x1="{left}" y1="{y:.1f}" x2="{width-right}" y2="{y:.1f}" stroke="#d8e0da" stroke-width="1"/>')
+        labels.append(f'<text x="{left-10}" y="{y+4:.1f}" text-anchor="end" font-size="12" fill="#52645b">{fmt(value)}</text>')
+
+    date_labels = []
+    if dates:
+        label_indices = sorted(set([0, max(0, len(dates)//2), len(dates)-1]))
+        for index in label_indices:
+            date_labels.append(
+                f'<text x="{x_pos(index):.1f}" y="{height-24}" text-anchor="middle" font-size="12" fill="#52645b">{html.escape(dates[index][5:])}</text>'
+            )
+
+    polylines = []
+    points = []
+    legend_items = []
+
+    for kas in include_kas:
+        color = KAS_COLORS.get(kas, "#333")
+        stroke_width = 4 if kas == REFERENCE_KAS else 2.4
+        dash = ' stroke-dasharray="7,4"' if metric.endswith("_delta") and kas == REFERENCE_KAS else ""
+        coordinates = []
+        for index, item in enumerate(timeseries):
+            value = item["values"].get(kas, {}).get(metric)
+            y = y_pos(value)
+            if y is None:
+                continue
+            x = x_pos(index)
+            coordinates.append(f"{x:.1f},{y:.1f}")
+            points.append(
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="{3.4 if kas == REFERENCE_KAS else 2.6}" fill="{color}">'
+                f'<title>Kas {kas} | {html.escape(item["date"])} | {fmt(value)} {html.escape(unit)}</title>'
+                f'</circle>'
+            )
+        if len(coordinates) >= 2:
+            polylines.append(
+                f'<polyline points="{" ".join(coordinates)}" fill="none" stroke="{color}" stroke-width="{stroke_width}" stroke-linejoin="round" stroke-linecap="round"{dash}/>'
+            )
+        elif len(coordinates) == 1:
+            x, y = coordinates[0].split(",")
+            points.append(f'<circle cx="{x}" cy="{y}" r="4" fill="{color}"/>')
+
+        legend_items.append(
+            f'<span class="legend-item"><span class="legend-line" style="background:{color};"></span>Kas {kas}{" referentie" if kas == REFERENCE_KAS else ""}</span>'
+        )
+
+    zero_line = ""
+    if metric.endswith("_delta") and y_min < 0 < y_max:
+        y0 = y_pos(0)
+        zero_line = f'<line x1="{left}" y1="{y0:.1f}" x2="{width-right}" y2="{y0:.1f}" stroke="#222" stroke-width="1.4" stroke-dasharray="4,4"/>'
+
+    svg = f"""
+    <div class="chart-card">
+      <h2>{html.escape(title)}</h2>
+      <div class="legend">{"".join(legend_items)}</div>
+      <div class="svg-wrap">
+        <svg viewBox="0 0 {width} {height}" role="img" aria-label="{html.escape(title)}">
+          <rect x="0" y="0" width="{width}" height="{height}" rx="12" fill="#ffffff"/>
+          {''.join(grid)}
+          {zero_line}
+          <line x1="{left}" y1="{top}" x2="{left}" y2="{height-bottom}" stroke="#9bad9f" stroke-width="1"/>
+          <line x1="{left}" y1="{height-bottom}" x2="{width-right}" y2="{height-bottom}" stroke="#9bad9f" stroke-width="1"/>
+          {''.join(labels)}
+          {''.join(date_labels)}
+          {''.join(polylines)}
+          {''.join(points)}
+        </svg>
+      </div>
+      <p class="chart-note">Laatste {len(timeseries)} dagen. Kas4 is de referentiekas en wordt dikker weergegeven.</p>
+    </div>
+    """
+    return svg
 
 
 def render_page(data):
@@ -262,6 +430,14 @@ def render_page(data):
     diff_rows = [[f"Kas {i['kas']}", f"{fmt(i['dtmax'])} °C", fmt(i["dvdmax"]), fmt(i["dvdavg"])] for i in data["differences"]]
     critical_rows = [[i["date"], f"Kas {i['kas']}", fmt(i["vd"])] for i in data["critical"]]
 
+    charts = ""
+    if data.get("timeseries"):
+        charts = (
+            render_line_chart("VD max per kas - laatste 20 dagen", data["timeseries"], "vdmax", "VD")
+            + render_line_chart("Temperatuur max per kas - laatste 20 dagen", data["timeseries"], "tmax", "°C")
+            + render_line_chart("Verschil VD max t.o.v. Kas4 - laatste 20 dagen", data["timeseries"], "vd_delta", "VD")
+        )
+
     return f"""<!doctype html>
 <html lang="nl">
 <head>
@@ -280,6 +456,14 @@ def render_page(data):
     table {{ width:100%; border-collapse:collapse; background:white; border-radius:14px; overflow:hidden; margin:18px 0 32px; box-shadow:0 8px 20px rgba(0,0,0,.06); }}
     th, td {{ padding:10px 12px; border-bottom:1px solid #e3e8e4; text-align:left; }}
     th {{ background:#dfeae3; }}
+    .chart-card {{ background:white; border-radius:14px; padding:18px 18px 10px; margin:22px 0 28px; box-shadow:0 8px 20px rgba(0,0,0,.06); }}
+    .chart-card h2 {{ margin:0 0 10px; }}
+    .svg-wrap {{ width:100%; overflow-x:auto; }}
+    .svg-wrap svg {{ width:100%; min-width:760px; height:auto; display:block; }}
+    .legend {{ display:flex; flex-wrap:wrap; gap:10px 16px; margin:8px 0 12px; color:#32473a; font-size:14px; }}
+    .legend-item {{ display:inline-flex; align-items:center; gap:6px; }}
+    .legend-line {{ display:inline-block; width:24px; height:4px; border-radius:999px; }}
+    .chart-note {{ margin:8px 0 4px; color:#52645b; font-size:13px; }}
   </style>
 </head>
 <body>
@@ -292,6 +476,9 @@ def render_page(data):
       <div class="card"><div>Datapunten</div><div class="value">{data['rows_count']}</div></div>
       <div class="card"><div>Bron</div><div>{html.escape(data['source'])}</div></div>
     </div>
+
+    {charts}
+
     <h2>Samenvatting per kas</h2>
     {render_table(["Kas", "Gem. Tmax", "Hoogste Tmax", "Gem. VD max", "Hoogste VD max", "Gem. VD gemiddeld"], summary_rows)}
     <h2>Afwijking t.o.v. Kas4</h2>
