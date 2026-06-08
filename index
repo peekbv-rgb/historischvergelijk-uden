@@ -1,0 +1,351 @@
+<!doctype html>
+<html lang="nl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Klimaat Historisch Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    :root {
+      --bg: #eef3f1;
+      --card: #ffffff;
+      --text: #14211d;
+      --muted: #61706b;
+      --accent: #0f6b54;
+      --accent2: #1a89a6;
+      --danger: #b7352d;
+      --warning: #b97a00;
+      --line: #dce5e1;
+      --soft: #f6faf8;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(135deg, #e8f1ee 0%, #f7faf9 100%);
+      color: var(--text);
+    }
+    header {
+      padding: 28px 34px 18px;
+      background: #102720;
+      color: white;
+    }
+    header h1 { margin: 0 0 6px; font-size: 28px; letter-spacing: .2px; }
+    header p { margin: 0; color: #c8d8d3; }
+    main { padding: 24px 34px 44px; max-width: 1500px; margin: auto; }
+    .toolbar {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-bottom: 18px;
+    }
+    .toolbar form, .toolbar .selectbox {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px;
+      box-shadow: 0 6px 20px rgba(0,0,0,.04);
+    }
+    select, input[type=file], button, .btn {
+      font: inherit;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      padding: 9px 11px;
+      background: white;
+      color: var(--text);
+    }
+    button, .btn {
+      background: var(--accent);
+      color: white;
+      border-color: var(--accent);
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+    }
+    .grid { display: grid; gap: 16px; }
+    .kpis { grid-template-columns: repeat(5, minmax(150px, 1fr)); }
+    .two { grid-template-columns: 1.25fr .75fr; }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 18px;
+      box-shadow: 0 10px 28px rgba(20,33,29,.06);
+    }
+    .kpi .label { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+    .kpi .value { font-size: 28px; font-weight: 760; }
+    .kpi .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    h2 { margin: 0 0 13px; font-size: 20px; }
+    h3 { margin: 0 0 10px; font-size: 17px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { padding: 9px 10px; border-bottom: 1px solid var(--line); text-align: right; }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: var(--muted); font-weight: 650; background: var(--soft); position: sticky; top: 0; }
+    .table-wrap { overflow: auto; max-height: 520px; border-radius: 12px; border: 1px solid var(--line); }
+    .pill {
+      display: inline-block;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      background: #e8efec;
+      color: #244239;
+    }
+    .pill.HEET { background: #ffe3df; color: var(--danger); }
+    .pill.WARM { background: #fff1d3; color: var(--warning); }
+    .pill.KOEL { background: #dff2ff; color: #12617c; }
+    .advice { margin: 0; padding-left: 20px; }
+    .advice li { margin: 9px 0; line-height: 1.45; }
+    .error {
+      background: #fff0ee;
+      border: 1px solid #ffc6bf;
+      color: #7b2019;
+      padding: 16px;
+      border-radius: 14px;
+    }
+    .meta { color: var(--muted); font-size: 13px; margin-top: 4px; }
+    canvas { min-height: 330px; }
+    @media (max-width: 1000px) {
+      main, header { padding-left: 18px; padding-right: 18px; }
+      .kpis, .two { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Klimaat Historisch Dashboard</h1>
+  <p>Analyse van Excel- of CSV-historie per afdeling: temperatuur, VD, piekdagen en afwijkingen.</p>
+</header>
+
+<main>
+  <div class="toolbar">
+    <div class="selectbox">
+      <form method="get" action="/">
+        <label>Databron</label>
+        <select name="source" onchange="this.form.submit()">
+          <option value="auto" {% if source == 'auto' %}selected{% endif %}>Auto</option>
+          <option value="excel" {% if source == 'excel' %}selected{% endif %}>Excel</option>
+          <option value="csv" {% if source == 'csv' %}selected{% endif %}>CSV-map per_dag</option>
+        </select>
+        {% if selected_upload %}<input type="hidden" name="upload" value="{{ selected_upload }}" />{% endif %}
+      </form>
+    </div>
+
+    <form method="post" action="/upload" enctype="multipart/form-data">
+      <input type="file" name="file" accept=".xlsx" required />
+      <button type="submit">Excel uploaden</button>
+    </form>
+
+    {% if uploads %}
+    <div class="selectbox">
+      <form method="get" action="/">
+        <label>Geüpload bestand</label>
+        <select name="upload" onchange="this.form.submit()">
+          <option value="">Kies bestand</option>
+          {% for file in uploads %}
+            <option value="{{ file }}" {% if selected_upload == file %}selected{% endif %}>{{ file }}</option>
+          {% endfor %}
+        </select>
+      </form>
+    </div>
+    {% endif %}
+  </div>
+
+  {% if error %}
+    <div class="error"><strong>Datafout:</strong> {{ error }}</div>
+  {% elif analysis %}
+
+  <section class="grid kpis">
+    <div class="card kpi">
+      <div class="label">Periode</div>
+      <div class="value">{{ analysis.day_count }}</div>
+      <div class="sub">dagen · {{ analysis.date_min }} t/m {{ analysis.date_max }}</div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Afdelingen</div>
+      <div class="value">{{ analysis.afdelingen | length }}</div>
+      <div class="sub">{{ analysis.afdelingen }}</div>
+    </div>
+    <div class="card kpi">
+      <div class="label">WARM</div>
+      <div class="value">{{ analysis.markers.get('WARM', 0) }}</div>
+      <div class="sub">dagen gemarkeerd warm</div>
+    </div>
+    <div class="card kpi">
+      <div class="label">HEET</div>
+      <div class="value">{{ analysis.markers.get('HEET', 0) }}</div>
+      <div class="sub">dagen gemarkeerd heet</div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Onvolledig</div>
+      <div class="value">{{ analysis.incomplete_days }}</div>
+      <div class="sub">max. {{ analysis.max_measurements }} metingen/dag</div>
+    </div>
+  </section>
+
+  <p class="meta">Bron: {{ analysis.source }}</p>
+
+  <section class="grid two" style="margin-top:16px;">
+    <div class="card">
+      <h2>VD max per afdeling</h2>
+      <canvas id="vdChart"></canvas>
+    </div>
+    <div class="card">
+      <h2>Advies / aandachtspunten</h2>
+      <ol class="advice">
+        {% for item in analysis.advice %}
+          <li>{{ item }}</li>
+        {% endfor %}
+      </ol>
+    </div>
+  </section>
+
+  <section class="grid two" style="margin-top:16px;">
+    <div class="card">
+      <h2>Temperatuur max per afdeling + buiten</h2>
+      <canvas id="tempChart"></canvas>
+    </div>
+    <div class="card">
+      <h2>Warme/hete dagen: groepsvergelijking</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Groep</th><th>Gem. Tmax</th><th>Gem. VD max</th></tr></thead>
+          <tbody>
+          {% for row in analysis.group_compare %}
+            <tr>
+              <td>{{ row.groep }}</td>
+              <td>{{ row.temp_max_avg_warm_hot }}</td>
+              <td>{{ row.vd_max_avg_warm_hot }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" style="margin-top:16px;">
+    <h2>Samenvatting per afdeling</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Afdeling</th><th>Gem. Tmax</th><th>Hoogste Tmax</th><th>Gem. VD max</th><th>Hoogste VD max</th><th>Gem. VD gemiddeld</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in analysis.department_summary %}
+          <tr>
+            <td>Afdeling {{ row.afd }}</td>
+            <td>{{ row.temp_max_avg }}</td>
+            <td>{{ row.temp_max_high }}</td>
+            <td>{{ row.vd_max_avg }}</td>
+            <td>{{ row.vd_max_high }}</td>
+            <td>{{ row.vd_gem_avg }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="grid two" style="margin-top:16px;">
+    <div class="card">
+      <h2>Top 10 kritische dagen</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Datum</th><th>Markering</th><th>Buiten max</th><th>Straling</th><th>VD piek</th><th>VD afd</th><th>T piek</th><th>T afd</th><th>Metingen</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in analysis.critical_days %}
+            <tr>
+              <td>{{ row.Datum }}</td>
+              <td><span class="pill {{ row.Markering }}">{{ row.Markering }}</span></td>
+              <td>{{ row.Temp_buiten_max }}</td>
+              <td>{{ row.Straling_piek }}</td>
+              <td>{{ row.VD_max_all }}</td>
+              <td>{{ row.VD_max_afd }}</td>
+              <td>{{ row.Temp_max_all }}</td>
+              <td>{{ row.Temp_max_afd }}</td>
+              <td>{{ row.N_metingen }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Laatste 20 dagregels</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              {% for col in analysis.table_cols %}<th>{{ col }}</th>{% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in analysis.table_rows %}
+            <tr>
+              {% for col in analysis.table_cols %}
+                <td>
+                  {% if col == 'Markering' %}
+                    <span class="pill {{ row[col] }}">{{ row[col] }}</span>
+                  {% else %}
+                    {{ row[col] }}
+                  {% endif %}
+                </td>
+              {% endfor %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <script>
+    const labels = {{ analysis.labels | tojson }};
+    const vdData = {{ analysis.chart_vd | tojson }};
+    const tempData = {{ analysis.chart_temp | tojson }};
+
+    function makeDatasets(obj) {
+      return Object.entries(obj).map(([label, data]) => ({
+        label,
+        data,
+        borderWidth: 2,
+        tension: 0.25,
+        pointRadius: 1.5
+      }));
+    }
+
+    new Chart(document.getElementById('vdChart'), {
+      type: 'line',
+      data: { labels, datasets: makeDatasets(vdData) },
+      options: {
+        responsive: true,
+        interaction: { mode: 'index', intersect: false },
+        scales: { y: { title: { display: true, text: 'VD max' } } },
+        plugins: { legend: { position: 'bottom' } }
+      }
+    });
+
+    new Chart(document.getElementById('tempChart'), {
+      type: 'line',
+      data: { labels, datasets: makeDatasets(tempData) },
+      options: {
+        responsive: true,
+        interaction: { mode: 'index', intersect: false },
+        scales: { y: { title: { display: true, text: '°C max' } } },
+        plugins: { legend: { position: 'bottom' } }
+      }
+    });
+  </script>
+  {% endif %}
+</main>
+</body>
+</html>
